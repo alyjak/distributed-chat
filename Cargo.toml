@@ -1,0 +1,11 @@
+[package]
+name = "assignment"
+version = "0.1.0"
+authors = ["Andrew Lyjak <andrew.lyjak@gmail.com>"]
+
+[dependencies]
+clap = "2.32.0"
+tokio = "0.1.11"
+futures = "0.1.25"
+bytes = "0.4.11"
+crc = "1.8.1"
