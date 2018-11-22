@@ -23,21 +23,50 @@
 //! every peer_B who has peer_C in their broadcast list doesn't all simultaneously rebroadcast to
 //! peer_C.
 //!
-//! Implementation order
-//! 1. cmd line parse for client
-//! 1. input parse and echo client messages
-//! 1. send message to server address, get NACK back
-//! 1. cmd line parse for server
-//! 1. connect to port for server
-//! 1. receive client message, print to server cmd line
-//! 1. send ack to client
-//! 1. Store connection socket for client in btreemap
-//! 1. broadcast to each client.
+//! TODO: Replace unbounded senders with their bounded counterparts.
 //!
+//! Architecture:
+//!
+//!  TcpListener
+//!     v
+//! +-----------+            +------------+                       +---------------------+
+//! | TcpStream |<-MsgCodec->| PeerSocket |<-UnboundedMsgChannel->| PeerConfig | Client |
+//! +-----------+            +------------+                       |------------|        |
+//! | TcpStream |<-MsgCodec->| PeerSocket |<-UnboundedMsgChannel->| PeerConfig |        |
+//! +-----------+            +------------+                       +------------+        |
+//! | ...       |   ...      |  ...       |  ...                  | ...        |        |
+//! +-----------+            +------------+                       +------------+--------+
+//!                                                                                ^
+//!                                                                UnboundedBytesChannel
+//!                                                                                v
+//!                                                                           +----------+
+//!                                                                           | Terminal |
+//!                                                                           +----------+
+//!                                                                              ^     v
+//!                                                                           stdin stdout
 
+extern crate byteorder;
 extern crate bytes;
 extern crate crc;
+#[macro_use]
 extern crate futures;
 extern crate tokio;
 
 pub mod message;
+pub mod peer;
+pub mod terminal;
+
+use bytes::Bytes;
+use futures::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+// Tokio (and futures) use cooperative scheduling without any
+// preemption. If a task never yields execution back to the executor,
+// then other tasks may be starved.
+//
+// To deal with this, robust applications should not have any unbounded
+// loops. In this example, we will read at most `LINES_PER_TICK` lines
+// from the client on each tick.
+//
+// If the limit is hit, the current task is notified, informing the
+// executor to schedule the task again asap.
+pub const LINES_PER_TICK: usize = 10;

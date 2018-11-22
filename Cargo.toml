@@ -4,8 +4,9 @@ version = "0.1.0"
 authors = ["Andrew Lyjak <andrew.lyjak@gmail.com>"]
 
 [dependencies]
-clap = "2.32.0"
-tokio = "0.1.11"
-futures = "0.1.25"
+byteorder = "1.2.7"
 bytes = "0.4.11"
+clap = "2.32.0"
 crc = "1.8.1"
+futures = "0.1.25"
+tokio = "0.1.11"
