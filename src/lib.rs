@@ -27,24 +27,26 @@
 //!
 //! Architecture:
 //!
-//!  TcpListener
-//!     v
-//! +-----------+            +------------+                       +---------------------+
-//! | TcpStream |<-MsgCodec->| PeerSocket |<-UnboundedMsgChannel->| PeerConfig | Client |
-//! +-----------+            +------------+                       |------------|        |
-//! | TcpStream |<-MsgCodec->| PeerSocket |<-UnboundedMsgChannel->| PeerConfig |        |
-//! +-----------+            +------------+                       +------------+        |
-//! | ...       |   ...      |  ...       |  ...                  | ...        |        |
-//! +-----------+            +------------+                       +------------+--------+
-//!                                                                                ^
-//!                                                                UnboundedBytesChannel
-//!                                                                                v
-//!                                                                           +----------+
-//!                                                                           | Terminal |
-//!                                                                           +----------+
-//!                                                                              ^     v
-//!                                                                           stdin stdout
-
+//! +---------------------+
+//! | TcpListener(stream) |
+//! +---------------------+
+//!     ^                     /-->print                /->print                        /->print
+//!            +-------------------+  +--------------------+  +---------------------------+
+//!  network   |  Socket(future)   |->|  MsgClient(future) |<-|    Terminal(stream)       |
+//!            |  ==============   |  |  ================= |  |    ================       |
+//! --[bytes]->|MsgCodec(TcpStream)>-->--[msg|peerconfig]-->-->-.                         |
+//! <-[bytes]--|ACK(msg) _/        |  +--------------------+  |  v                        |
+//!            +-------------------+                          |TerminalCodec(stdin/stdout)|<-userinput
+//!                                                           |                       |   |
+//!            +-------------------+  +--------------------+  |                      /|   |
+//! <-[bytes]--|MsgCodec(TcpStream)<--<--[msg|clientconf]--<--<--msg----------------' |   |
+//! --[bytes]->|ACK(msg)_/         |  +--------------------+  +-----------------------|---+
+//!            +-------------------+                                                  |
+//!                                                     +-------------------+       [cmd]
+//!                                      PeerConfig   <-| CmdClient(future) |        /
+//!                                      ClientConfig <-|                   |<------/
+//!                                                     +-------------------+
+//!                                                            \-->print
 extern crate byteorder;
 extern crate bytes;
 extern crate crc;

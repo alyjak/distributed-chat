@@ -39,23 +39,80 @@ fn main() {
         self_addr
     );
 
-    let peer_map = Arc::new(Mutex::new(PeerStateMap(HashMap::new())));
-    let client_multiplexer = Arc::new(Mutex::new(
+    // Our three global variables used between the threads to control connection
+    // states.
+    let sock_map = Arc::new(Mutex::new(SockMap(HashMap::new())));
+    let peer_map = Arc::new(Mutex::new(PeerMap(HashMap::new())));
+    let name_map = Arc::new(Mutex::new(NameMap(HashMap::new())));
+    let ping_map = Arc::new(Mutex::new(PingMap(HashMap::new())));
+    let username = matches.value_of("NAME").unwrap();
+    let out_conf = Arc::new(Mutex::new(OutputConfig {
+        username: username.clone(),
+        msg_typ: MsgTyp::Broadcast,
+        to: vec![],
+    }));
+
+    // Listener receives incoming connections
     let listener = TcpListener::bind(&self_addr);
+    // Listen for incoming messages, decode them, filter them through
+    // peer-specific configuration, and send to stdout.
+    let peer_server = listener.incoming()
+        .for_each(move |socket| {
+            let addr = socket.peer_addr().unwrap();
+            // Get or insert peer into peer_map
+            { // minimize the scope of the peer_map lock
+                let p_map = peer_map.clone().lock();
+                if !p_map.contains_key(addr) {
+                    p_map.insert(addr, PeerConfig::new(addr));
+                }
+            }
+            let peer = PeerChannel::new(
+                socket,
+                addr,
+                username.clone(),
+                peer_map.clone(),
+                user_map.clone(),
+            );
+            { // Minimize the scope of the socket map lock
+                let s_map = sock_map.clone().lock();
+                s_map.insert(addr, peer);
+            }
+            tokio::spawn(peer_channel);
+            Ok(())
+        })
+        .map_err(|err| println!("Error accepting incoming connection: {}", err));
 
-    // Listen for incoming
-    let chatserver = listener.incoming().for_each(move |socket| {
-        // Spawn a task to process each incoming connection
-        process_incoming_connection(socket, peer_map.clone());
+    // Terminal decodes/encodes terminal input/output into messages or
+    // commands. Commands configure peer-specific configuration or output
+    // message configuration. Messages are sent to peers based on output message
+    // configuration. Messages are sent through an open socket if it is
+    // available, otherwise a new socket is opened.
+    framed = TerminalCodec::new(peer_map.clone()).framed(StdioSocket::new());
+    (msg_writer, cmdmsg_reader) = framed.split();
+    cmdmsg_reader.for_each(|cmdmsg| {
+        let connection = match cmdmsg {
+            CmdMsg::Cmd(cmd) => {
+                CmdClient{
+                    cmd: cmd,
+                    peer_map: peer_map.clone(),
+                    name_map: name_map.clone(),
+                    out_conf: out_conf.clone(),
+                }
+            },
+            CmdMsg::Msg(msg) => {
+                SenderClient{
+                    username: username.clone(),
+                    msg: msg,
+                    peer_map: peer_map.clone(),
+                    sock_map: sock_map.clone(),
+                    out_conf: out_conf.clone(),
+                }
+            },
+        };
+        tokio::spawn(connection);
         Ok(())
-    });
+    }).map_err(|err| {println!("Error accepting terminal input: {}", err);});
 
-    let terminal = TerminalInput::new(peer_map.clone());
-    let cmdserver = tokio.spawn(
-        TerminalInput::new(peer_map.clone())
-            .for_each(|msg| terminal_parse(msg, peer_map.clone()))
-            .map_err(|e| println!("Aborted terminal connection because of error: {}", e)),
-    );
-
-    tokio::run(chatserver);
+    tokio::spawn(term_server);
+    tokio::run(peer_server);
 }
