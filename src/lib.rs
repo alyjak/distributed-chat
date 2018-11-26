@@ -23,30 +23,28 @@
 //! every peer_B who has peer_C in their broadcast list doesn't all simultaneously rebroadcast to
 //! peer_C.
 //!
-//! TODO: Replace unbounded senders with their bounded counterparts.
-//!
 //! Architecture:
 //!
 //! +---------------------+
 //! | TcpListener(stream) |
 //! +---------------------+
-//!     ^                     /-->print                /->print                        /->print
-//!            +-------------------+  +--------------------+  +---------------------------+
-//!  network   |  Socket(future)   |->|  MsgClient(future) |<-|    Terminal(stream)       |
-//!            |  ==============   |  |  ================= |  |    ================       |
-//! --[bytes]->|MsgCodec(TcpStream)>-->--[msg|peerconfig]-->-->-.                         |
-//! <-[bytes]--|ACK(msg) _/        |  +--------------------+  |  v                        |
-//!            +-------------------+                          |TerminalCodec(stdin/stdout)|<-userinput
-//!                                                           |                       |   |
-//!            +-------------------+  +--------------------+  |                      /|   |
-//! <-[bytes]--|MsgCodec(TcpStream)<--<--[msg|clientconf]--<--<--msg----------------' |   |
-//! --[bytes]->|ACK(msg)_/         |  +--------------------+  +-----------------------|---+
-//!            +-------------------+                                                  |
-//!                                                     +-------------------+       [cmd]
-//!                                      PeerConfig   <-| CmdClient(future) |        /
-//!                                      ClientConfig <-|                   |<------/
-//!                                                     +-------------------+
-//!                                                            \-->print
+//!     ^                  ,--> non_blocking_print(nbp)     ,-> nbp
+//!            +----------------------+  +--------------------+  +---------------------------+
+//!  network   |  PeerChannel(future) |->|  MsgClient(future) |<-|    Terminal(stream)       |
+//!            |  ==============      |  |  ================= |  |    ================       |
+//! --[bytes]->|--MsgCodec(TcpStream)->-->--[msg|peerconfig]-->-->-.                         |
+//! <-[bytes]--|--ACK(msg) _/         |  +--------------------+  |  v                        |<-userinput
+//!            +----------------------+                          |TerminalCodec(stdin/stdout)|
+//!                    ...                                       |                       |   |->nbp(messages)
+//!            +----------------------+  +--------------------+  |                      /|   |
+//! <-[bytes]--|MsgCodec(TcpStream)---<--<--[msg|clientconf]--<--<--msg------+---------' |   |
+//! --[bytes]->|ACK(msg)_/            |  +--------------------+  +------------\----------|---+
+//!            +----------------------+                                        \         |
+//!                                                                             `-<---[cmd]
+//!                                                                 PeerConfig<-------/
+//!                                                               ClientConfig<------/
+//!                                                                        nbp<-----'
+//!
 extern crate byteorder;
 extern crate bytes;
 extern crate crc;
