@@ -20,17 +20,17 @@
 //! TODO: I think this could be cleaned up in terms of memory usage.
 //!
 
-use std::{fmt, io};
 use std::collections::HashMap;
-use std::str::{from_utf8, from_utf8_unchecked};
 use std::net::SocketAddr;
+use std::str::{from_utf8, from_utf8_unchecked};
 use std::time::SystemTime;
+use std::{fmt, io};
 
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::{BufMut, Bytes, BytesMut};
 use crc::crc32;
 use tokio::codec::{Decoder, Encoder};
-use tokio::prelude::{Async, Future, Poll, Sink};
+use tokio::prelude::{task, Async, Future, Poll, Sink};
 
 use peer::SockMapAccessor;
 
@@ -102,13 +102,13 @@ impl fmt::Display for NACKKind {
 impl fmt::Display for MsgTyp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            MsgTyp::PM => write!(f, "sent"),
+            MsgTyp::PM => write!(f, "message"),
             MsgTyp::BC => write!(f, "broadcast"),
             MsgTyp::BBC => write!(f, "blind broadcast"),
             MsgTyp::Connect => write!(f, "connected"),
             MsgTyp::Disconnect => write!(f, "disconnected"),
-            MsgTyp::ACK => write!(f, "confirmed message"),
-            MsgTyp::NACK(kind) => write!(f, "rejected message ({})", kind),
+            MsgTyp::ACK => write!(f, "ACK"),
+            MsgTyp::NACK(kind) => write!(f, "NACK ({})", kind),
         }
     }
 }
@@ -175,14 +175,15 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn new(
-        typ: MsgTyp,
-        msgnum: u8,
-        from: Bytes,
-        to: Bytes,
-        content: Bytes,
-    ) -> Message {
-        let mut msg = Message {typ, msgnum, from, to, content, crc: 0u32};
+    pub fn new(typ: MsgTyp, msgnum: u8, from: Bytes, to: Bytes, content: Bytes) -> Message {
+        let mut msg = Message {
+            typ,
+            msgnum,
+            from,
+            to,
+            content,
+            crc: 0u32,
+        };
         let (_, crc) = msg.raw();
         msg.crc = crc;
         msg
@@ -222,11 +223,19 @@ impl Message {
 /// TODO, when there's non string content types, this needs to be expanded
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "[{} {}]", unsafe { from_utf8_unchecked(&self.from[..]) }, self.typ);
+        write!(
+            f,
+            "[{} {}]",
+            unsafe { from_utf8_unchecked(&self.from[..]) },
+            self.typ
+        );
         match self.typ {
-            MsgTyp::ACK | MsgTyp::NACK(_) => Ok(()),
-            _ => write!(f, ": {}", unsafe { from_utf8_unchecked(&self.content[..]) })
-        }
+            MsgTyp::ACK | MsgTyp::NACK(_) | MsgTyp::Connect | MsgTyp::Disconnect => {}
+            _ => {
+                write!(f, ": {}", unsafe { from_utf8_unchecked(&self.content[..]) });
+            }
+        };
+        Ok(())
     }
 }
 
@@ -246,17 +255,14 @@ impl MsgBuilder {
     pub fn new(username: Bytes) -> MsgBuilder {
         MsgBuilder {
             username,
-            msgnum: 0u8,
+            msgnum: 1u8,
             ping_map: HashMap::new(),
         }
     }
 
     pub fn build(&mut self, typ: MsgTyp, to: Bytes, content: Bytes) -> Message {
         self.msgnum = self.msgnum.wrapping_add(1);
-        self.ping_map.insert(
-            self.msgnum,
-            SystemTime::now()
-        );
+        self.ping_map.insert(self.msgnum, SystemTime::now());
         let msg = Message::new(typ, self.msgnum, self.username.clone(), to, content);
         msg
     }
@@ -420,7 +426,7 @@ impl MsgCodec {
             self.msgnum.clone(),
             self.from.clone(),
             self.to.clone(),
-            self.content.clone()
+            self.content.clone(),
         ))
     }
 }
@@ -471,7 +477,7 @@ impl Decoder for MsgCodec {
                 // Ran out of buffer, no frame available yet, return None
                 Ok(false) => return Ok(None),
                 // Passed a parse step, continue parsing
-                Ok(true) => {},
+                Ok(true) => {}
                 // Parse failure, return the failure reason so we can NACK the sender.
                 Err(parsefault) => {
                     self.clear();
@@ -502,10 +508,12 @@ pub struct MsgClient {
 }
 
 impl MsgClient {
-    pub fn new(msg: Message,
-               addr: SocketAddr,
-               sock_map: SockMapAccessor) -> MsgClient {
-        MsgClient { msg, addr, sock_map }
+    pub fn new(msg: Message, addr: SocketAddr, sock_map: SockMapAccessor) -> MsgClient {
+        MsgClient {
+            msg,
+            addr,
+            sock_map,
+        }
     }
 }
 
@@ -515,18 +523,23 @@ impl Future for MsgClient {
 
     fn poll(&mut self) -> Poll<(), Self::Error> {
         // Wait for our connection to finish initializing
-        if !self.sock_map.lock().unwrap().inner.contains_key(&self.addr) {
-            return Ok(Async::NotReady);
-        }
-        let mut lock = self.sock_map.lock().unwrap();
-        let sink = lock.inner.get_mut(&self.addr).unwrap();
+        let mut s_lock = self.sock_map.lock().unwrap();
+        let s_map = &mut s_lock.inner;
+        let sink = match s_map.get_mut(&self.addr) {
+            None => {
+                task::current().notify();
+                return Ok(Async::NotReady);
+            }
+            Some(sink) => sink,
+        };
+
         match sink.start_send(self.msg.clone()) {
             Err(_) => return Err(()),
             _ => {}
         };
         match sink.poll_complete() {
             Ok(val) => Ok(val),
-            Err(_) => Err(())
+            Err(_) => Err(()),
         }
     }
 }

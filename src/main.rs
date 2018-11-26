@@ -6,6 +6,7 @@ extern crate futures;
 extern crate tokio;
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -14,17 +15,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
 
-use assignment::message::{MsgClient, MsgTyp};
+use assignment::message::{MsgBuilder, MsgClient, MsgTyp};
 
-use assignment::peer::{SockMap, PeerChannel, PeerConfig, PeerMap, UserMap, SockMapAccessor,
-                       PeerMapAccessor, UserMapAccessor};
-use assignment::terminal::{StdioSocket, TerminalCodec};
+use assignment::peer::{
+    BuilderAccessor, PeerChannel, PeerConfig, PeerMap, PeerMapAccessor, SockMap, SockMapAccessor,
+    UserMap, UserMapAccessor,
+};
+use assignment::terminal::{StdioSocket, TerminalCodec, HELP};
 
-// TODO: tx isn't connected
-// ignore isn't processed
-// command parsing
-// end to end message
-// nothing is creating the unbounded future socket
 fn main() -> Result<(), Box<std::error::Error>> {
     let matches = clap_app!(
         myapp =>
@@ -37,37 +35,50 @@ fn main() -> Result<(), Box<std::error::Error>> {
     ).get_matches();
 
     let self_addr = matches.value_of("ADDRESS").unwrap().parse().unwrap();
-    println!(
-        "Welcome {}, binding to address: {} and listening for messages",
+    print!(
+        "Welcome {}, binding to address: {} and listening for messages\n",
         matches.value_of("NAME").unwrap(),
         self_addr
     );
+    print!("{}\n\n> ", HELP);
+    io::stdout().flush()?;
 
     // Our three global variables used between the threads to control connection
     // states.
     let peer_ref_username = Bytes::from(&matches.value_of("NAME").unwrap()[..]);
-    let peer_ref_sock_map = Arc::new(Mutex::new(SockMap{ inner: HashMap::new() }));
-    let peer_ref_peer_map = Arc::new(Mutex::new(PeerMap{ inner: HashMap::new() }));
-    let peer_ref_user_map = Arc::new(Mutex::new(UserMap{ inner: HashMap::new() }));
+    let peer_ref_sock_map = Arc::new(Mutex::new(SockMap {
+        inner: HashMap::new(),
+    }));
+    let peer_ref_peer_map = Arc::new(Mutex::new(PeerMap {
+        inner: HashMap::new(),
+    }));
+    let peer_ref_user_map = Arc::new(Mutex::new(UserMap {
+        inner: HashMap::new(),
+    }));
+    let peer_ref_bldr_mut = Arc::new(Mutex::new(MsgBuilder::new(peer_ref_username.clone())));
 
+    // This is ugly but the only way I figured out to get variables moved into the closures
     let term_ref_username = peer_ref_username.clone();
     let term_ref_sock_map = peer_ref_sock_map.clone();
     let term_ref_peer_map = peer_ref_peer_map.clone();
     let term_ref_user_map = peer_ref_user_map.clone();
-
+    let term_ref_bldr_mut = peer_ref_bldr_mut.clone();
 
     // Listener receives incoming connections
     let listener = TcpListener::bind(&self_addr)?;
     // Listen for incoming messages, decode them, filter them through
     // peer-specific configuration, and send to stdout.
-    let peer_server = listener.incoming()
+    let peer_server = listener
+        .incoming()
         .for_each(move |socket| {
-            let _ = init_channel(socket,
-                                 peer_ref_username.clone(),
-                                 peer_ref_peer_map.clone(),
-                                 peer_ref_sock_map.clone(),
-                                 peer_ref_user_map.clone());
-            Ok(())
+            init_channel(
+                socket,
+                peer_ref_username.clone(),
+                peer_ref_peer_map.clone(),
+                peer_ref_sock_map.clone(),
+                peer_ref_user_map.clone(),
+                peer_ref_bldr_mut.clone(),
+            )
         }).map_err(|err| {
             println!("Error accepting incoming connection: {}", err);
         });
@@ -76,53 +87,56 @@ fn main() -> Result<(), Box<std::error::Error>> {
     // peer-specific configuration or output message configuration. Messages are sent to peers based
     // on output message configuration. Messages are sent through an open socket if it is available,
     // otherwise a new socket is opened.
-    let (_sink, cmdmsg_stream) = TerminalCodec::new(term_ref_username.clone(),
-                                                    term_ref_sock_map.clone(),
-                                                    term_ref_peer_map.clone(),
-                                                    term_ref_user_map.clone())
-        .framed(StdioSocket::new())
-        .split();
-    let term_server = cmdmsg_stream.for_each(move |(msg, addrs)| {
-        let s_mutex = term_ref_sock_map.clone();
-        let s_lock = s_mutex.lock().unwrap();
-        let s_map = & s_lock.inner;
-        for addr in addrs {
-            if !s_map.contains_key(&addr) {
-                let chan_ref_username = term_ref_username.clone();
-                let chan_ref_sock_map = term_ref_sock_map.clone();
-                let chan_ref_peer_map = term_ref_peer_map.clone();
-                let chan_ref_user_map = term_ref_user_map.clone();
+    let (_sink, cmdmsg_stream) = TerminalCodec::new(
+        term_ref_sock_map.clone(),
+        term_ref_peer_map.clone(),
+        term_ref_user_map.clone(),
+        term_ref_bldr_mut.clone(),
+    ).framed(StdioSocket::new())
+    .split();
+    let term_server = cmdmsg_stream
+        .for_each(move |(msg, addrs)| {
+            let s_mutex = term_ref_sock_map.clone();
+            let s_lock = s_mutex.lock().unwrap();
+            let s_map = &s_lock.inner;
+            for addr in addrs {
+                if !s_map.contains_key(&addr) {
+                    // This is ugly but the only way I figured out to get variables moved into the
+                    // closures
+                    let chan_ref_username = term_ref_username.clone();
+                    let chan_ref_sock_map = term_ref_sock_map.clone();
+                    let chan_ref_peer_map = term_ref_peer_map.clone();
+                    let chan_ref_user_map = term_ref_user_map.clone();
+                    let chan_ref_bldr_mut = term_ref_bldr_mut.clone();
 
-                let connection = TcpStream::connect(&addr)
-                    .and_then(move |socket| {
-                        // TODO: Is this going to immediately drop? thereby ruining our outgoing
-                        // connection?
-                        let peer = PeerChannel::new(
-                            socket,
-                            addr.clone(),
-                            chan_ref_username.clone(),
-                            chan_ref_peer_map.clone(),
-                            chan_ref_sock_map.clone(),
-                            chan_ref_user_map.clone(),
-                        ).map_err(|_| ());
-                        tokio::spawn(peer);
-                        Ok(())
-                    }).map_err(|_| ());
-                tokio::spawn(connection);
+                    let connection = TcpStream::connect(&addr)
+                        .and_then(move |socket| {
+                            init_channel(
+                                socket,
+                                chan_ref_username.clone(),
+                                chan_ref_peer_map.clone(),
+                                chan_ref_sock_map.clone(),
+                                chan_ref_user_map.clone(),
+                                chan_ref_bldr_mut.clone(),
+                            )
+                        }).map_err(|err| {
+                            println!("Error negotiating outgoing connection: {}", err);
+                        });
+                    tokio::spawn(connection);
+                }
+                let client = MsgClient::new(msg.clone(), addr, term_ref_sock_map.clone());
+                tokio::spawn(client);
             }
-            let client = MsgClient::new(msg.clone(), addr, term_ref_sock_map.clone());
-            tokio::spawn(client);
-        }
-        if msg.typ == MsgTyp::Disconnect {
-            // TODO: how do I close out nicely?
-            panic!("This is a stubbed out, sloppy execution of a termination command")
-        } else {
-            Ok(())
-        }
-    }).map_err(|err| {
-        println!("Error accepting terminal input: {}", err);
-    });
-
+            if msg.typ == MsgTyp::Disconnect {
+                // TODO: how do I close out nicely? Need to issue rt.shutdown_now() from inside a
+                // closure..
+                panic!("This is a stubbed out, sloppy execution of a termination command")
+            } else {
+                Ok(())
+            }
+        }).map_err(|err| {
+            println!("Error accepting terminal input: {}", err);
+        });
 
     // Create the runtime
     let mut rt = Runtime::new().unwrap();
@@ -135,14 +149,18 @@ fn main() -> Result<(), Box<std::error::Error>> {
     Ok(())
 }
 
-fn init_channel(sock: TcpStream,
-                username: Bytes,
-                peer_map: PeerMapAccessor,
-                sock_map: SockMapAccessor,
-                user_map: UserMapAccessor) -> Result<(), ()> {
+fn init_channel(
+    sock: TcpStream,
+    username: Bytes,
+    peer_map: PeerMapAccessor,
+    sock_map: SockMapAccessor,
+    user_map: UserMapAccessor,
+    bldr_mut: BuilderAccessor,
+) -> Result<(), io::Error> {
     let addr = sock.peer_addr().unwrap();
     // Get or insert peer into peer_map
-    { // minimize the scope of the peer_map lock
+    {
+        // minimize the scope of the peer_map lock
         let p_mutex = peer_map.clone();
         let mut p_lock = p_mutex.lock().unwrap();
         let p_map = &mut p_lock.inner;
@@ -157,6 +175,7 @@ fn init_channel(sock: TcpStream,
         peer_map.clone(),
         sock_map.clone(),
         user_map.clone(),
+        bldr_mut.clone(),
     ).map_err(|e| println!("Error parsing socket: {}", e));
     tokio::spawn(peer);
     Ok(())
