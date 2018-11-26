@@ -1,53 +1,43 @@
-//! Provides async methods for sending messages and application commands from a termina
-//! session. Also locks stdout, forcing threads to push messages through its internal peer2stdout
-//! buffer in order to print to screen. This _should_ help stability and understanding the
-//! application interfaces.
+//! Provides async methods for sending messages and application commands from a terminal
+//! session.
 //!
 //! Implements the terminal, client, and associated data structures
 //!
 
-use std::collections::{HashMap, HashSet};
 use std::io::{self, Write, Stdin, Stdout};
 use std::net::SocketAddr;
+use std::str::{FromStr, SplitWhitespace, from_utf8};
 
-use bytes::{BufMut, Bytes, BytesMut};
-
-use futures::sync::mpsc;
-use tokio::net::tcp::ConnectFuture;
-use tokio::net::TcpStream;
+use bytes::{BufMut, Bytes, BytesMut, IntoBuf};
+use futures::stream::{SplitSink, SplitStream};
+use tokio::codec::{Decoder, Encoder, Framed};
+use tokio::io::{stdout, stderr};
 use tokio::prelude::*;
 
-use message::{Message, MsgRx, MsgTx, MsgTyp};
-use peer::SocketMapAccessor;
-use LINES_PER_TICK;
+use message::{Message, MsgBuilder, MsgTyp};
+use peer::{SockMapAccessor, PeerConfig, PeerMapAccessor, PeerVolume, UserMapAccessor};
 
-enum CmdMsg {
-    Cmd(CmdKind),
-    Msg(Message),
+fn into_bytes(peers: &Vec<SocketAddr>) -> Bytes {
+    let peervec: Vec<String> = peers.iter().map(|socket| socket.to_string()).collect();
+    Bytes::from(peervec.join(",").as_bytes())
 }
 
-enum CmdKind {
-    Volume(SocketAddr, PeerVolume),
-    Quit,
-    Connect(SocketAddr),
-    Type(MsgTyp),
-    To(Vec<SocketAddr>),
-}
-
+#[derive(Debug)]
 enum ParseState {
     Init,
     ParseLine,
-    CmdFound,
-    MsgFound,
+    ParseCmd,
+    ParseMsg,
 }
 
-struct StdioSocket {
+#[derive(Debug)]
+pub struct StdioSocket {
     stdin: Stdin,
     stdout: Stdout,
 }
 
 impl StdioSocket {
-    fn new() -> StdioSocket {
+    pub fn new() -> StdioSocket {
         StdioSocket {
             stdin: io::stdin(),
             stdout: io::stdout(),
@@ -84,29 +74,144 @@ impl AsyncWrite for StdioSocket {
 }
 
 /// Terminal wraps stdin and stdout. Peers send messages into the other end of the peer2stdout mpsc
-/// buffer. Commands and messages from stdin go to the Client, which then either processes
-/// the command or sends a message to the addressed peers, according to the parsed stdin contents.
+/// buffer. Commands and messages from stdin go to the Client, which then either processes the
+/// command or sends a message to the addressed peers, according to the parsed stdin contents.
 #[derive(Debug)]
-struct TerminalCodec {
+pub struct TerminalCodec {
+    typ: MsgTyp,
+    to: Vec<SocketAddr>,
     bytebuf: BytesMut,
     state: ParseState,
     idx: usize,
     line_buf: BytesMut,
     msg_buf: BytesMut,
+    sock_map: SockMapAccessor,
     peer_map: PeerMapAccessor,
+    user_map: UserMapAccessor,
+    builder: MsgBuilder,
 }
 
 /// Polls stdin for commands and messages. Commands are performed as side effects. Messages are sent
 /// using a futures Stream.
 impl TerminalCodec {
-    fn new(peer_map: PeerMapAccessor) -> TerminalCodec {
+    pub fn new(username: Bytes,
+               sock_map: SockMapAccessor,
+               peer_map: PeerMapAccessor,
+               user_map: UserMapAccessor) -> TerminalCodec {
         TerminalCodec {
-            framebuf: BytesMut::with_capacity(1024),
+            typ: MsgTyp::BC,
+            to: vec![],
+            bytebuf: BytesMut::with_capacity(1024),
             state: ParseState::Init,
-            buf_idx: 0,
-            line_buf: ByteMut::with_capacity(1024),
-            msg_buf: ByteMut::with_capacity(1024),
+            idx: 0,
+            line_buf: BytesMut::with_capacity(1024),
+            msg_buf: BytesMut::with_capacity(1024),
+            sock_map,
             peer_map,
+            user_map,
+            builder: MsgBuilder::new(username),
+        }
+    }
+
+    fn parse_userlist(&self, userlist: &mut SplitWhitespace) -> Result<Vec<SocketAddr>, String> {
+        let mut addrs: Vec<SocketAddr> = vec![];
+        let lock = self.user_map.lock().unwrap();
+        let map = &lock.inner;
+        for line in userlist {
+            // This may be either a fully qualified socketaddress, or a username
+            let an_addr = SocketAddr::from_str(line);
+            let name = Bytes::from(line.as_bytes());
+            if map.contains_key(&name) {
+                addrs.push(map.get(&name).unwrap().clone());
+            } else if an_addr.is_ok() {
+                addrs.push(an_addr.unwrap());
+            } else {
+                return Err(format!("Peer {} cannot be parsed as a username or address", line));
+            }
+        }
+        Ok(addrs)
+    }
+
+    fn parse_command(&mut self, cmdargs: &mut SplitWhitespace) -> Result<Option<(Message, Vec<SocketAddr>)>, String> {
+        match &cmdargs.next().unwrap().to_lowercase()[..] {
+            "/msg" => {
+                let msgtyp = match cmdargs.next() {
+                    None => return Err("Insufficient arguments".to_string()),
+                    Some(msgtyp) => {
+                        match &msgtyp.trim().to_lowercase()[..] {
+                            "pm" | "private" | "private_message" => MsgTyp::PM,
+                            "bc" | "broadcast" => MsgTyp::BC,
+                            "bbc" | "blind_broadcast" => MsgTyp::BBC,
+                            _ => return Err(format!("Unknown message type {}", msgtyp)),
+                        }
+                    }
+                };
+                self.typ = msgtyp;
+                Ok(None)
+            },
+            "/volume" => {
+                let setting = match cmdargs.next() {
+                    None => return Err("Insufficient arguments".to_string()),
+                    Some(vol) => {
+                        match &vol.trim().to_lowercase()[..] {
+                            "debug" | "loud" => PeerVolume::Loud,
+                            "normal" | "default" => PeerVolume::Normal,
+                            "quiet" => PeerVolume::Quiet,
+                            "block" | "mute" => PeerVolume::Mute,
+                            _ => return Err(format!("Unknown volume setting {}", vol)),
+                        }
+                    },
+                };
+                let peers = self.parse_userlist(cmdargs)?;
+                {
+                    let mut lock = self.peer_map.lock().unwrap();
+                    let map = &mut lock.inner;
+                    for addr in peers {
+                        if !map.contains_key(&addr) {
+                            map.insert(
+                                addr,
+                                Box::new(PeerConfig::new(addr))
+                            );
+                        }
+                        map.get_mut(&addr).unwrap().vol = setting.clone();
+                    }
+                }
+                Ok(None)
+            },
+            "/connect" => {
+                let peers = self.parse_userlist(cmdargs)?;
+                let builder = &mut self.builder;
+                Ok(Some(
+                    (builder.build(
+                        MsgTyp::Connect,
+                        into_bytes(&peers),
+                        Bytes::new()),
+                     peers)
+                ))
+            },
+            "/to" => {
+                self.to = self.parse_userlist(cmdargs)?;
+                Ok(None)
+            },
+            "/quit" | "/exit" => {
+                // Broadcast a disconnect message to let peers know we're quitting
+                // only need to send to open connections
+                let connected_peers = self.sock_map
+                    .lock()
+                    .unwrap()
+                    .inner
+                    .keys()
+                    .map(|k| k.clone())
+                    .collect();
+                Ok(Some(
+                    (self.builder.build(
+                        MsgTyp::Disconnect,
+                        Bytes::new(),
+                        Bytes::new()),
+                     connected_peers)
+                ))
+            },
+            _ => Err(format!("Unknown command {:?}", cmdargs)),
         }
     }
 }
@@ -114,7 +219,7 @@ impl TerminalCodec {
 /// Implement polling stdin/stdout as a Stream so that it occurs for the entire duration of the
 /// executor.
 impl Decoder for TerminalCodec {
-    type Item = CmdMsg;
+    type Item = (Message, Vec<SocketAddr>);
     type Error = io::Error;
 
     /// Poll stdin for new input and send it out for the Client future to process, also
@@ -123,15 +228,15 @@ impl Decoder for TerminalCodec {
         loop {
             match self.state {
                 ParseState::Init => {
-                    match buf[self.buf_idx..]
+                    match buf[self.idx..]
                         .windows(1)
                         .enumerate()
                         .find(|(_, byte)| byte == b"\n")
                         .map(|(idx, _)| idx)
                     {
                         None => {
-                            self.buf_idx = buf.len();
-                            return Ok(Async::NotReady)
+                            self.idx = buf.len();
+                            return Ok(None)
                         },
                         Some(idx) => {
                             self.line_buf.clear();
@@ -139,7 +244,7 @@ impl Decoder for TerminalCodec {
                                 self.line_buf.reserve(idx+1);
                             }
                             let line = buf.split_to(idx);
-                            self.buf_idx = 0;
+                            self.idx = 0;
                             self.line_buf.put(line);
                             self.state = ParseState::ParseLine;
                         },
@@ -150,7 +255,9 @@ impl Decoder for TerminalCodec {
                     // command. Commands are all strings, so try and read the line as a string. If
                     // that fails, its a message. If it succeeds, strip leading/trailing whitespace
                     // and then see if the first char is the command initiator '/' in honor of IRC.
-                    match str::from_utf8(&self.line_buf[..]) {
+
+                    let linebytes = Bytes::from(&self.line_buf[..]);
+                    match from_utf8(&linebytes[..]) {
                         Ok(string) => {
                             let line = string.trim();
                             if line.starts_with("/") {
@@ -161,7 +268,7 @@ impl Decoder for TerminalCodec {
                                 // buffering it? That's what I'll do for now
                             } else {
                                 self.msg_buf.put(line.into_buf());
-                                self.msg_buf.put(Bytes::from(b"\n"));
+                                self.msg_buf.put("\n".into_buf());
                                 self.state = ParseState::ParseMsg;
                             }
                         },
@@ -175,19 +282,18 @@ impl Decoder for TerminalCodec {
                     };
                 },
                 ParseState::ParseMsg => {
-                    let len = msg_buf.len()
-                    if len >= 3 && self.msg_buf[len - 3 ..] == b"\n\n\n" {
+                    let len = self.msg_buf.len();
+                    if len >= 3 && &self.msg_buf[len - 3 ..] == b"\n\n\n" {
                         // Message terminated, time to send it.
                         self.msg_buf.truncate(len - 3); // remove the triple newline control sequence
-                        let client = MsgClient::new(
-                            msg: msg_buf.freeze(),
-                            self.peer_map.clone(),
-                            self.sock_map.clone(),
-                            self.out_conf.clone(),
+                        let msg = self.builder.build(
+                            self.typ.clone(),
+                            into_bytes(&self.to),
+                            self.msg_buf.clone().freeze(),
                         );
                         self.msg_buf.clear();
                         self.state = ParseState::Init;
-                        return Ok(Async::Ready(Some(Either::A(client))));
+                        return Ok(Some((msg, self.to.clone())));
                     } else {
                         // Message is not terminated, go back to finding lines
                         self.state = ParseState::Init;
@@ -196,20 +302,22 @@ impl Decoder for TerminalCodec {
                 ParseState::ParseCmd => {
                     // can unwrap because this is only entered via ParseLine, which checks that the
                     // buf is valid unicode.
-                    let line = str::from_utf8(&self.line_buf[..]);
-                    let cmdargs = line.split_whitespace().iter();
+                    let linebytes = Bytes::from(&self.line_buf[..]);
+                    let line = from_utf8(&linebytes[..]).unwrap();
+                    let mut cmdargs = line.split_whitespace();
                     // Since ParseLine checks for a leading '/', unwrap will work
-                    let cmd = match cmdargs.next().unwrap() {
-                        "/volume" => {
-                            
-                        }self.cmd_verbosity(&cmdargs[1..]),
-                        "/connect" => self.cmd_connect(&cmdargs[1..]),
-                        "/to" => self.cmd_set_to(&cmdargs[1..]),
-                        "/quit" => self.cmd_quit(),
-                        _ => Err(format!("Unknown command {:?}", cmdargs)),
-                    }
                     self.line_buf.clear();
                     self.state = ParseState::Init;
+                    let result = self.parse_command(&mut cmdargs);
+                    match result {
+                        Ok(Some((_msg, _recipients))) => {
+                            stdout().poll_write(b"Command accepted")?;
+                        },
+                        Ok(None) => {}
+                        Err(err) => {
+                            stderr().poll_write(format!("Command failed: {}", err).as_bytes())?;
+                        }
+                    }
                 },
             }
         };
@@ -221,245 +329,97 @@ impl Encoder for TerminalCodec {
     type Error = io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let verbosity = self.peer_map.lock().get(item.from)?.verbosity;
-        match verbosity {
-            Debug => {
-                dst.put(format!("{}", item)[..]);
+        let mut volume = PeerVolume::Normal;
+        if let Some(addr) = self.user_map.lock().unwrap().inner.get(&item.from) {
+            volume = self.peer_map.lock().unwrap().inner.get(addr).unwrap().vol.clone();
+        }
+        match volume {
+            PeerVolume::Loud => {
+                dst.put(format!("{}", item).as_bytes());
                 match item.typ {
                     MsgTyp::ACK | MsgTyp::NACK(_) => {
-                        let msgnum = item.content.into_buf().get_u8;
-                        match self.ping_map.lock()?.get(msgnum) {
+                        let msgnum = item.content[0] as u8;
+                        match self.builder.ping_map.get(&msgnum) {
                             None => {
-                                dst.put(&format!("Unknown roundtrip msgtime for msgnum {}, there is
-                                                 no ping_map entry for that message.", msgnum)[..]);
+                                dst.put(format!("Unknown roundtrip msgtime for msgnum {}, there is
+                                                 no ping_map entry for that message.", msgnum).as_bytes());
                             },
                             Some(time) => {
-                                let roundtrip = 
-                                dst.put(&format!("Roundtrip time for msgnum {} = {}.",
-                                                 msgnum, time.elapsed())[..]);
+                                match time.elapsed() {
+                                    Ok(elapsed) => {
+                                        dst.put(format!("Roundtrip time for msgnum {} = {:?}.",
+                                                        msgnum, elapsed).as_bytes());
+                                    },
+                                    Err(e) => {
+                                        dst.put(format!("Error computing roundtrip time for msgnum
+                                                         {}: Er: {:?}.", msgnum, e).as_bytes());
+                                    },
+                                };
                             },
                         };
                     },
                     _ => {},
                 };
             },
-            Standard => {
+            PeerVolume::Normal => {
                 match item.typ {
                     MsgTyp::PM | MsgTyp::BC | MsgTyp::BBC => {
-                        dst.put(&format!("{}", item)[..])
+                        dst.put(format!("{}", item).as_bytes());
                     },
                     _ => {}
                 };
             },
-            Quiet => {
+            PeerVolume::Quiet => {
                 match item.typ {
                     MsgTyp::PM => {
-                        dst.put(&format!("{}", item)[..])
+                        dst.put(format!("{}", item).as_bytes());
                     },
                     _ => {}
                 }
             },
-            Block => {},
+            PeerVolume::Mute => {},
+        };
+        Ok(())
+    }
+}
+
+
+pub struct TermClient {
+    msg: Message,
+    pub sink: SplitSink<Framed<StdioSocket, TerminalCodec>>,
+    pub stream: SplitStream<Framed<StdioSocket, TerminalCodec>>,
+}
+
+impl TermClient {
+    pub fn new(user: Bytes,
+               sock_map: SockMapAccessor,
+               peer_map: PeerMapAccessor,
+               user_map: UserMapAccessor,
+               msg: Message) -> TermClient {
+        let (sink, stream) = TerminalCodec::new(user.clone(), sock_map, peer_map, user_map)
+            .framed(StdioSocket::new())
+            .split();
+        TermClient {
+            msg,
+            sink,
+            stream,
         }
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum PeerVolume {
-    /// Write out all messages (ACK, NACK, etc) as well a standard.
-    Debug,
-    /// Write out broadcasts and directed messages
-    Normal,
-    /// Only write directed messages
-    Quiet,
-    /// Do not write any messages from this peer to stdout. Do not send messages to this peer.
-    Block,
-}
-
-/// PeerConfig stores client preferences about a peer.
-#[derive(Debug)]
-pub struct PeerConfig {
-    /// Remote address for the peer.
-    addr: SocketAddr,
-    /// Active username for this address
-    name: Bytes,
-    /// The clients configured verbosity for this peer
-    vol: PeerVolume,
-    /// One of the assignment objectives is to count the roundtrip time between sending a message
-    /// and receiving an ACK. To do this we need to have a buffer to store the time sent for each
-    /// message. The message protocol uses a wrapping u8 as a counter, so we know this buffer won't
-    /// grow without bound, because we're indexed based on the message counter.
-    ping_map: Hashmap<u8, SystemTime>,
-    /// Connections can be blocked, initializing, open, or closed.
-    // state: ConnectionState,
-    // /// If there's an active socket to the peer this will buffer messages from the terminal client
-    // /// to that remote peer.
-}
-
-impl PeerConfig {
-    fn new(addr: SocketAddr) -> PeerConfig {
-        SocketAddr {
-            addr,
-            name: Bytes::new(), // Empty name by default
-            vol: PeerVolume::Standard,
-            ping_map: Hashmap::new(),
-        }
-    }
-}
-
-
-/// PeerMap is a map in the Client that holds channels to the peers and I/O preferences the client
-/// holds for each known peer.
-#[derive(Debug)]
-struct PeerMap(HashMap<SocketAddr, Box<PeerConfig>>);
-
-/// PeerMap is a map in the Client that holds channels to the peers and I/O preferences the client
-/// holds for each known peer.
-#[derive(Debug)]
-struct UsernameMap(HashMap<String, SocketAddr>);
-
-/// Takes in unstructured terminal input and transforms it into client-server commands or messages
-/// to send to peers.
-struct MsgConfig {
-    username: String,
-    message_type: MsgTyp,
-    recipients: Vec<SocketAddr>,
-}
-
-struct MsgClient {
-    client2stdout: BytesTx,
-    /// Broadcast messages are only sent to peers who are already connected or
-    /// connecting and who are not blocked.
-    peermap: PeerConfigAccessor,
-    usernamemap: UsernameAccessor,
-    socketmap: SocketMapAccessor,
-}
-
-/// Client is the main processing function of the application: it multiplexes out messages to peers
-/// and demultiplexes messages from peers and sends them to the client.
-impl MsgClient {
-    fn new(username: String, stdin2client: BytesRx, client2stdout: BytesTx) -> Client {
-        MsgClient {
-            username,
-            stdin2client,
-            parsebuf: BytesMut::new(),
-            client2stdout,
-            message_type: MsgTyp::BC,
-            recipients: vec![],
-            client2peers: PeerMap(HashMap::new()),
-        }
-    }
-
-    /// Looks at the start of parsebuf to determine if there's a command string there, if not then
-    /// the buffer is a message. If there is a command, returns the command and advances the
-    fn cmd_verbosity(&mut self, args: &[&str]) -> Option<String> {
-        Err("TODO".to_string())
-    }
-
-    fn cmd_connect(&mut self, args: &[&str]) -> Option<String> {
-        // Need to be able to handle username clashes
-        Err("TODO".to_string())
-    }
-
-    fn cmd_to(&mut self, args: &[&str]) -> Option<String> {
-        Err("TODO".to_string())
-    }
-
-    fn cmd_quit(&mut self, args: &[&str]) -> Option<String> {
-        Err("TODO".to_string())
-    }
-
-    fn send_msg(&self, msg: Message) {
-        for addr in to.iter() {
-            self.peermap
-                .get(addr)?
-                .client2peer
-                .unwrap_or(return io::Error::new(
-                    io::ErrorKind::ConnectionClosed,
-                    "Socket to a recipient is closed"))
-                .put(msg)?;
-        }
-    }
-}
-
-impl Future for MsgClient {
+impl Future for TermClient{
     type Item = ();
-    type Error = io::Error;
+    type Error = ();
 
     fn poll(&mut self) -> Poll<(), Self::Error> {
-        // 1. update peermap with any socketmap elements that aren't in self.peerconfig
-        { // bracket in order to scope the mutex lock
-            let socket = self.socketmap.lock();
-            let config_addr_set = HashSet::FromIterator(self.peermap.keys());
-            let socket_addr_set = HashSet::FromIterator(socket.keys());
-            // 1. ensure the config addrs that don't have sockets are in the disconnected state
-            for closed_addr in config_addr_set.difference(socket_addr_set) {
-                self.peermap.get(closed_addr)?.state = ConnectionState::Disconnected;
-                self.socketmap.remove(closed_addr);
-            }
-            // 2. Open new config entries for socket addrs that don't have configs
-            for new_addr in socket_addr_set.difference(config_addr_set) {
-                let mut peer_socket = socket.get(new_addr)?;
-                // Create sockets for peer and client messages
-                let (peer_tx, peer_rx) = mpsc::unbounded();
-                let (client_tx, client_rx) = mpsc::unbounded();
-                self.peermap.insert(
-                    new_addr,
-                    PeerConfig {
-                        address: new_addr,
-                        username: peer_socket.username.clone(),
-                        verbosity: PeerVolume::Normal,
-                        state: ConnectionState::Connected,
-                        client2peer: Ok(client_tx),
-                        peer2client: Ok(peer_rx),
-                    }
-                );
-                // Hook in the other side of the sockets
-                peer_socket.peer2client = Ok(peer_tx);
-                peer_socket.client2peer = Ok(client_rx);
-                // Update the username address map
-                *self.socketmap.insert(peer_socket.username.clone(), new_addr.clone());
-            }
+        // Wait for our connection to finish initializing
+        match self.sink.start_send(self.msg.clone()) {
+            Err(_) => return Err(()),
+            _ => {},
+        };
+        match self.sink.poll_complete() {
+            Ok(val) => Ok(val),
+            Err(_) => Err(())
         }
-
-        // 2. buffer terminal input
-        for i in 0..LINES_PER_TICK {
-            match self.stdin2client.poll()? {
-                Async::Ready(Some(v)) => {
-                    if v.len() > self.parsebuf.remaining_mut() {
-                        self.parsebuf.reserve(v.len())
-                    }
-                    self.parsebuf.put(&v[..]);
-                }
-                Async::NotReady => break,
-            }
-            if i + 1 == LINES_PER_TICK {
-                task::current().notify();
-            }
-        }
-        // 3. parse buffered terminal input
-        loop {
-            if self.try_parse_cmd() == None {
-                if self.try_parse_msg() == None {
-                    break;
-                }
-            }
-        }
-
-        // 4. flush peer output
-        for peer in self.peermap.values() {
-            if let Some(msgbuf) = peer.peer2client {
-                for i in 0..LINES_PER_TICK {
-                    match peer.poll()? {
-                        Async::Ready(Some(msg)) => self.print_message(msg, peer.verbosity),
-                        Async::NotReady => break,
-                    }
-                    if i + 1 == LINES_PER_TICK {
-                        task::current().notify();
-                    }
-                }
-            }
-        }
-        Async::Ready(())
     }
 }

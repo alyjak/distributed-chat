@@ -21,25 +21,23 @@
 //!
 
 use std::{fmt, io};
-use std::fmt::Display;
+use std::collections::HashMap;
+use std::str::{from_utf8, from_utf8_unchecked};
 use std::net::SocketAddr;
-use std::str;
+use std::time::SystemTime;
 
-use byteorder::NetworkEndian;
+use byteorder::{ByteOrder, NetworkEndian};
 use bytes::{BufMut, Bytes, BytesMut};
 use crc::crc32;
-use futures::future::Either;
-use futures::sync::mpsc;
 use tokio::codec::{Decoder, Encoder};
-use tokio::io as tio;
-// its a nice pattern, that's all
+use tokio::prelude::{Async, Future, Poll, Sink};
+
+use peer::SockMapAccessor;
+
+// Why this pattern? its a nice easy to spot palendrome, that's all
 pub const HDR_0: u8 = 0b10101010;
 pub const HDR_1: u8 = 0b01010101;
 pub const HDR: [u8; 2] = [HDR_0, HDR_1];
-
-/// Shorthand for the two sides of the message channel used between the peer and Client.
-pub type MsgRx = mpsc::UnboundedReceiver<Message>;
-pub type MsgTx = mpsc::UnboundedSender<Message>;
 
 fn get_len(buf: &mut BytesMut) -> Option<usize> {
     if buf.len() < 4 {
@@ -63,7 +61,7 @@ fn len_to_bytes(len: usize) -> [u8; 4] {
 
 /// Message type. Can either broadcast to all connected peers, or send a private message to a single
 /// peer
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MsgTyp {
     /// Send a private message to a peer or group of peers.
     PM,
@@ -83,25 +81,25 @@ pub enum MsgTyp {
 }
 
 /// When a NACK is received, this identifies the reason
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NACKKind {
-    UserBlocked,
+    Blocked,
     ParseError,
     /// Identifies when a message is received with an already used message count
     Duplicate,
 }
 
-impl Display for NACKKind {
+impl fmt::Display for NACKKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            UserBlocked => write!(f, "blocked"),
-            ParseError => write!(f, "message parse failed"),
-            Duplicate => write!(f, "duplicate message"),
+            NACKKind::Blocked => write!(f, "blocked"),
+            NACKKind::ParseError => write!(f, "message parse failed"),
+            NACKKind::Duplicate => write!(f, "duplicate message"),
         }
     }
 }
 
-impl Display for MsgTyp {
+impl fmt::Display for MsgTyp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             MsgTyp::PM => write!(f, "sent"),
@@ -116,7 +114,7 @@ impl Display for MsgTyp {
 }
 
 /// This is next to typ_to_byte so they can be easily checked to be inverses of one another
-fn byte_to_typ(byte: u8) -> Result<MsgTyp, String> {
+fn byte_to_typ(byte: &u8) -> Result<MsgTyp, String> {
     match byte {
         01u8 => Ok(MsgTyp::PM),
         02u8 => Ok(MsgTyp::BC),
@@ -132,7 +130,7 @@ fn byte_to_typ(byte: u8) -> Result<MsgTyp, String> {
 }
 
 /// This is next to byte_to_typ so they can be easily checked to be inverses of one another
-fn typ_to_byte(typ: MsgTyp) -> u8 {
+fn typ_to_byte(typ: &MsgTyp) -> u8 {
     match typ {
         MsgTyp::PM => 01u8,
         MsgTyp::BC => 02u8,
@@ -140,7 +138,7 @@ fn typ_to_byte(typ: MsgTyp) -> u8 {
         MsgTyp::Connect => 20u8,
         MsgTyp::Disconnect => 21u8,
         MsgTyp::ACK => 40u8,
-        MsgTyp::NACK(NACKKind::UserBlocked) => 41u8,
+        MsgTyp::NACK(NACKKind::Blocked) => 41u8,
         MsgTyp::NACK(NACKKind::ParseError) => 42u8,
         MsgTyp::NACK(NACKKind::Duplicate) => 43u8,
     }
@@ -149,9 +147,8 @@ fn typ_to_byte(typ: MsgTyp) -> u8 {
 #[derive(Debug, Clone, PartialEq)]
 enum ParseState {
     Init,
-    Len,
-    From,
     Typ,
+    From,
     MsgNum,
     To,
     Content,
@@ -161,6 +158,116 @@ enum ParseState {
 
 #[derive(Debug, Clone)]
 pub struct Message {
+    /// Message type defines the message meaning
+    pub typ: MsgTyp,
+    /// Messages are sent with monotonically incrementing counters to help identify if any got lost
+    /// in transmission. The ACK protocol uses these numbers to communicate what messages were
+    /// received.
+    pub msgnum: u8,
+    /// The username of the message sender (the sender's address is available via the socket)
+    pub from: Bytes,
+    /// The addresses of all recipients of the message. This information allows broadcast groups to
+    /// be synchronized. Must be coercable into an array of `SocketAddr`s.
+    pub to: Bytes,
+    /// Final Content type is based on message type.
+    pub content: Bytes,
+    pub crc: u32,
+}
+
+impl Message {
+    pub fn new(
+        typ: MsgTyp,
+        msgnum: u8,
+        from: Bytes,
+        to: Bytes,
+        content: Bytes,
+    ) -> Message {
+        let mut msg = Message {typ, msgnum, from, to, content, crc: 0u32};
+        let (_, crc) = msg.raw();
+        msg.crc = crc;
+        msg
+    }
+
+    /// This is dynamic memory heavy :(
+    ///
+    /// Raw msg struct:
+    /// 0xAA55<msgtyp u8><msgnumber u8><fromlen u32><from String><tolen u32><to String><contentlen u32><content String>0x0<crc32 u32>
+    pub fn raw(&mut self) -> (Bytes, u32) {
+        let hdr: [u8; 4] = [HDR_0, HDR_1, typ_to_byte(&self.typ), self.msgnum];
+        let fromlen = len_to_bytes(self.from.len());
+        let tolen = len_to_bytes(self.to.len());
+        let contentlen = len_to_bytes(self.content.len());
+        let msglen = hdr.len()
+            + tolen.len()
+            + self.to.len()
+            + fromlen.len()
+            + self.from.len()
+            + contentlen.len()
+            + self.content.len();
+        let mut raw = BytesMut::with_capacity(msglen);
+        raw.put(&hdr[..]);
+        raw.put(&fromlen[..]);
+        raw.put(&self.from[..]);
+        raw.put(&tolen[..]);
+        raw.put(&self.to[..]);
+        raw.put(&contentlen[..]);
+        raw.put(&self.content[..]);
+
+        // calculate crc and send result
+        let crc = crc32::checksum_ieee(&raw[..]);
+        (raw.freeze(), crc)
+    }
+}
+
+/// TODO, when there's non string content types, this needs to be expanded
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "[{} {}]", unsafe { from_utf8_unchecked(&self.from[..]) }, self.typ);
+        match self.typ {
+            MsgTyp::ACK | MsgTyp::NACK(_) => Ok(()),
+            _ => write!(f, ": {}", unsafe { from_utf8_unchecked(&self.content[..]) })
+        }
+    }
+}
+
+/// Adds a wrapping message counter to each message we create and records the system time when the
+/// message was created, this allows us to track roundtrip time between sending a message and
+/// receiving an ACK.
+#[derive(Debug)]
+pub struct MsgBuilder {
+    /// We need access to the peer map in order to record timestamps of when messages were sent so
+    /// that we can record roundrip latency between transmission and reception of ACKs.
+    username: Bytes,
+    msgnum: u8,
+    pub ping_map: HashMap<u8, SystemTime>,
+}
+
+impl MsgBuilder {
+    pub fn new(username: Bytes) -> MsgBuilder {
+        MsgBuilder {
+            username,
+            msgnum: 0u8,
+            ping_map: HashMap::new(),
+        }
+    }
+
+    pub fn build(&mut self, typ: MsgTyp, to: Bytes, content: Bytes) -> Message {
+        self.msgnum = self.msgnum.wrapping_add(1);
+        self.ping_map.insert(
+            self.msgnum,
+            SystemTime::now()
+        );
+        let msg = Message::new(typ, self.msgnum, self.username.clone(), to, content);
+        msg
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MsgCodec {
+    /// The socket address we're decoding from
+    addr: SocketAddr,
+    /// This field isn't sent, its used to control parsing
+    state: ParseState,
     /// Message type defines the message meaning
     typ: MsgTyp,
     /// Messages are sent with monotonically incrementing counters to help identify if any got lost
@@ -177,139 +284,28 @@ pub struct Message {
     crc: u32,
 }
 
-impl Message {
-    fn new(
-        typ: MsgTyp,
-        msgnum: u8,
-        from: Bytes,
-        to: Bytes,
-        content: Bytes,
-    ) -> Message {
-        let mut msg = Message {typ, msgnum, from, to, content, crc: 0u32};
-        let (_, crc) = msg.raw();
-        msg.crc = crc;
-        msg
-    }
-
-    fn raw(&mut self) -> (Bytes, u32) {
-        let hdr: [u8; 4] = [HDR_0, HDR_1, typ_to_byte(self.typ), self.msgnum];
-        let from = self.from.as_bytes();
-        let fromlen = len_to_bytes(from.len());
-        let to = self.to.as_bytes();
-        let tolen = len_to_bytes(to.len());
-        let content = self.content;
-        let contentlen = len_to_bytes(content.len());
-        let msglen = hdr.len()
-            + tolen.len()
-            + to.len()
-            + fromlen.len()
-            + from.len()
-            + contentlen.len()
-            + content.len();
-        let raw = BytesMut::with_capacity(msglen);
-        raw.put(&hdr[..]);
-        raw.put(&fromlen[..]);
-        raw.put(&from[..]);
-        raw.put(&tolen[..]);
-        raw.put(&to[..]);
-        raw.put(&contentlen[..]);
-        raw.put(&content[..]);
-
-        // calculate crc and send result
-        (raw.freeze(), crc32::checksum_ieee(&raw[..]))
-    }
-
-/// TODO, when there's non string content types, this needs to be expanded
-impl Display for Message {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.state {
-            ParseState::Done => write!(f, "unparsed message"),
-            _ => {
-                write!(f, "[{} {}]", str::from_utf8(&self.from[..]), self.typ)?;
-                match self.typ {
-                    MsgTyp::ACK | MsgTyp::NACK(_) => Ok(()),
-                    _ => write!(f, ": {}", str::from_utf8(&self.content[..])?)
-                }
-            }
-        }
-    }
-}
-
-pub struct MessageBuilder {
-    /// We need access to the peer map in order to record timestamps of when messages were sent so
-    /// that we can record roundrip latency between transmission and reception of ACKs.
-    peer_map: PeerMapAccessor,
-    msgnum: u8,
-}
-
-impl MessageBuilder {
-    fn new(peer_map: PeerMapAccessor) -> MessageBuilder {
-        MessageBuilder {
-            peer_map,
-            msgnum = 0u8,
-        }
-    }
-
-    fn build(typ: MsgTyp, to: Bytes, content: Bytes) -> Message {
-        self.msgnum = self.tx_msgnum.wrapping_add(1);
-        self.ping_map.lock().insert(
-            self.msgnum,
-            SystemTime::now()
-        );
-        let msg = Message::new(typ, self.msgnum, self.username.clone(), to, content);
-        msg
-    }
-}
-
-/// TODO: Add timestamp of when received?
-#[derive(Debug, Clone)]
-pub struct MessageCodec {
-    /// The socket address we're decoding from
-    addr: SocketAddr,
-    /// This field isn't sent, its used to control parsing
-    state: ParseState,
-    /// Message type defines the message meaning
-    typ: Option<MsgTyp>,
-    /// Messages are sent with monotonically incrementing counters to help identify if any got lost
-    /// in transmission. The ACK protocol uses these numbers to communicate what messages were
-    /// received.
-    rx_msgnum: Option<u8>,
-    /// A counter to add to transmitted messages
-    tx_msgnum: u8,
-    /// The username of the message sender (the sender's address is available via the socket)
-    from: Option<Bytes>,
-    /// The addresses of all recipients of the message. This information allows broadcast groups to
-    /// be synchronized. Must be coercable into an array of `SocketAddr`s.
-    to: Option<Bytes>,
-    /// Final Content type is based on message type.
-    content: Option<Bytes>,
-    crc: Option<u32>,
-};
-
-impl MessageCodec {
-    fn new(addr: SocketAddr) -> MessageCodec {
-        Message {
+impl MsgCodec {
+    pub fn new(addr: SocketAddr) -> MsgCodec {
+        MsgCodec {
             addr,
             state: ParseState::Init,
-            peer_map,
-            typ: None,
-            tx_msgnum: 0,
-            rx_msgnum: None,
-            from: None,
-            to: None,
-            content: None,
-            crc: None,
+            typ: MsgTyp::BC,
+            msgnum: 0,
+            from: Bytes::new(),
+            to: Bytes::new(),
+            content: Bytes::new(),
+            crc: 0,
         }
     }
 
     fn clear(&mut self) {
-        self.state = MsgTyp::Init;
-        self.typ = None;
-        self.rx_msgnum = None;
-        self.from = None;
-        self.to = None;
-        self.content = None;
-        self.crc = None;
+        self.state = ParseState::Init;
+        self.typ = MsgTyp::BC;
+        self.msgnum = 0;
+        self.from = Bytes::new();
+        self.to = Bytes::new();
+        self.content = Bytes::new();
+        self.crc = 0;
     }
 
     fn parse_init(&mut self, buf: &mut BytesMut) -> Result<bool, String> {
@@ -334,7 +330,7 @@ impl MessageCodec {
         if buf.len() < 1 {
             return Ok(false);
         }
-        self.typ = Some(byte_to_typ(buf[0])?);
+        self.typ = byte_to_typ(&buf[0])?;
         let _ = buf.split_to(1);
         self.state = ParseState::MsgNum;
         Ok(true)
@@ -359,7 +355,7 @@ impl MessageCodec {
             Some(idx) => idx,
         };
         let contentbuf = buf.split_to(idx);
-        let content = match str::from_utf8(&contentbuf) {
+        let content = match from_utf8(&contentbuf) {
             Ok(cont) => cont.to_string(),
             Err(err) => return Err(format!("Could not parse field as a string: {}", err)),
         };
@@ -371,7 +367,7 @@ impl MessageCodec {
         match self.parse_str(buf)? {
             None => Ok(false),
             Some(from) => {
-                self.from = Some(from);
+                self.from = Bytes::from(from.as_bytes());
                 self.state = ParseState::To;
                 Ok(true)
             }
@@ -383,7 +379,7 @@ impl MessageCodec {
         match self.parse_str(buf)? {
             None => Ok(false),
             Some(to) => {
-                self.to = Some(to);
+                self.to = Bytes::from(to.as_bytes());
                 self.state = ParseState::Content;
                 Ok(true)
             }
@@ -397,7 +393,7 @@ impl MessageCodec {
             Some(idx) => idx,
         };
         let contentbuf = buf.split_to(idx).freeze();
-        self.content = Some(contentbuf);
+        self.content = contentbuf;
         self.state = ParseState::CRC;
         Ok(true)
     }
@@ -410,44 +406,29 @@ impl MessageCodec {
         let crcbuf = buf.split_to(4);
         let crc: u32 = NetworkEndian::read_u32(&crcbuf[..]);
 
-        self.crc = Some(crc);
+        self.crc = crc;
         self.state = ParseState::Done;
         Ok(true)
     }
 
-    /// This is dynamic memory heavy :(
-    ///
-    /// Raw msg struct:
-    /// 0xAA55<msgtyp u8><msgnumber u8><fromlen u32><from String><tolen u32><to String><contentlen u32><content String>0x0<crc32 u32>
-    fn assemble(&self) -> Option<(Bytes, u32)> {
+    fn assemble(&mut self) -> Option<Message> {
         if self.state != ParseState::Done {
             return None;
         }
-
-        if self.typ.is_none() || self.from.is_none() || self.to.is_none() || self.content.is_none()
-        {
-            return None;
-        }
-
-
-        // We can unwrap because in order to get to ParseState::Done, we have to
-        // go through ParseState::CRC, which will only occur if self.crc is set.
-        let msg = Message::new(
-            self.typ.unwrap().clone(),
-            self.rx_msgnum.unwrap().clone(),
-            self.from.unwrap().clone(),
-            self.to.unwrap().clone(),
-            self.content.unwrap().clone()
-        );
-
-
+        Some(Message::new(
+            self.typ.clone(),
+            self.msgnum.clone(),
+            self.from.clone(),
+            self.to.clone(),
+            self.content.clone()
+        ))
     }
 }
 
 /// Take in a Byte encoding of a message, return a message struct, or a parsing fault. See module
 /// doc for message format.
-impl Decoder for MessageCodec {
-    type Item = Either<Message, String>;
+impl Decoder for MsgCodec {
+    type Item = Result<Message, String>;
     type Error = io::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -465,7 +446,6 @@ impl Decoder for MessageCodec {
                 ParseState::Content => self.parse_content(buf),
                 ParseState::CRC => self.parse_crc(buf),
                 ParseState::Done => {
-                    self.clear();
                     match self.assemble() {
                         None => panic!(
                             "The only way this can occur is because of a bug, because
@@ -473,10 +453,12 @@ impl Decoder for MessageCodec {
                              successfully."
                         ),
                         Some(msg) => {
-                            if msg.crc == self.crc.unwrap() {
-                                return Ok(Some(Either::A(msg)));
+                            if msg.crc == self.crc {
+                                // Completed a message, return it!
+                                self.clear();
+                                return Ok(Some(Ok(msg)));
                             } else {
-                                Err("CRC check failed".to_string());
+                                Err("CRC check failed".to_string())
                             }
                         }
                     }
@@ -486,27 +468,65 @@ impl Decoder for MessageCodec {
             // sufficient data to parse, Error means the parse failed and the caller should send a
             // NACK::ParseFailure back to the message sender.
             match parse_result {
+                // Ran out of buffer, no frame available yet, return None
                 Ok(false) => return Ok(None),
+                // Passed a parse step, continue parsing
+                Ok(true) => {},
+                // Parse failure, return the failure reason so we can NACK the sender.
                 Err(parsefault) => {
-                    tio::stderr().poll_write(
-                        format!("Error parsing message from {}: {}", self.addr, parsefault)
-                    );
                     self.clear();
-                    return Ok(Some(Either::B(parsefault)));
+                    return Ok(Some(Err(parsefault)));
                 }
-                _ => {} // continue parsing
             }
         }
     }
 }
 
 /// Takes in a message struct, outputs a byte encoding of the message.
-impl Encoder for MessageCodec {
+impl Encoder for MsgCodec {
     type Item = Message;
     type Error = io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.put(&item.raw()[..]);
+        let (raw, crc) = item.clone().raw();
+        dst.put(raw);
+        dst.put_u32_be(crc);
         Ok(())
+    }
+}
+
+pub struct MsgClient {
+    msg: Message,
+    addr: SocketAddr,
+    sock_map: SockMapAccessor,
+}
+
+impl MsgClient {
+    pub fn new(msg: Message,
+               addr: SocketAddr,
+               sock_map: SockMapAccessor) -> MsgClient {
+        MsgClient { msg, addr, sock_map }
+    }
+}
+
+impl Future for MsgClient {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<(), Self::Error> {
+        // Wait for our connection to finish initializing
+        if !self.sock_map.lock().unwrap().inner.contains_key(&self.addr) {
+            return Ok(Async::NotReady);
+        }
+        let mut lock = self.sock_map.lock().unwrap();
+        let sink = lock.inner.get_mut(&self.addr).unwrap();
+        match sink.start_send(self.msg.clone()) {
+            Err(_) => return Err(()),
+            _ => {}
+        };
+        match sink.poll_complete() {
+            Ok(val) => Ok(val),
+            Err(_) => Err(())
+        }
     }
 }
