@@ -67,7 +67,7 @@ impl PeerConfig {
             addr,
             username: Bytes::new(), // Empty name by default
             // TODO: when things are working make this PeerVolume::Normal
-            vol: PeerVolume::Loud,
+            vol: PeerVolume::Normal,
         }
     }
 }
